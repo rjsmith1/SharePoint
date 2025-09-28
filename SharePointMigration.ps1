@@ -3,6 +3,8 @@
 Import-Module SharePointPnPPowerShell2019 -Force -DisableNameChecking
 Import-Module SharePointServer -DisableNameChecking -Force
 
+. d:\scripts\Migration\function_Copy-ShptListItemAttachment.ps1
+
 $FolderName = "Deployables"
 $ListName = "Accessories"
 $SrcSite = "https://SP16.local/SiteCol1/Site1"
@@ -85,11 +87,11 @@ foreach ($oldListField in $oldListFields) {
         $oldlistFieldObj = New-Object PSObject
         $oldlistFieldObj | Add-Member -MemberType NoteProperty -Name Hidden -Value $oldListField.Hidden
         $oldlistFieldObj | Add-Member -MemberType NoteProperty -Name CanBeDeleted -Value $oldListField.CanBeDeleted
-        $oldlistFieldObj | Add-Member -MemberType NoteProperty -Name DisplayName -Value $oldListField.Title
+        $oldlistFieldObj | Add-Member -MemberType NoteProperty -Name DisplayName -Value $oldListField.Title.Replace("'", '"')
         $oldlistFieldObj | Add-Member -MemberType NoteProperty -Name InternalName -Value $oldListField.InternalName.trim().replace(" ", "_x0020_")
         $oldlistFieldObj | Add-Member -MemberType NoteProperty -Name FieldType -Value $oldListField.TypeDisplayName
         $oldlistFieldObj | Add-Member -MemberType NoteProperty -Name FieldInternalType -Value $oldListField.TypeAsString
-        $oldlistFieldObj | Add-Member -MemberType NoteProperty -Name FieldDescription -Value $oldListField.Description
+        $oldlistFieldObj | Add-Member -MemberType NoteProperty -Name FieldDescription -Value $oldListField.Description.Replace("'", '"')
         $oldlistFieldObj | Add-Member -MemberType NoteProperty -Name FieldDefaultValue -Value $oldListField.DefaultValue
         $oldlistFieldObj | Add-Member -MemberType NoteProperty -Name Required -Value $oldListField.Required
         $oldlistFieldObj | Add-Member -MemberType NoteProperty -Name RequireUnique -Value $oldListField.EnforceUniqueValues
@@ -562,6 +564,12 @@ foreach ($oldListItem in $oldListItems) {
                 Clear-Variable NewListItem -ErrorAction SilentlyContinue
                 $NewListItem = Add-PnPListItem -List $ListName -Values $NewFieldsDict -Connection $conn2
                 if ($NewListItem) {
+                    $NewListItemId = $NewListItem.Id
+                    $dstItem = Get-PnPListItem -list $ListName -Id $NewListItemId -Connection $conn2
+                    Get-PnPProperty $oldListItem -Property AttachmentFiles -Connection $conn2 | Out-Null
+                    if($oldListItem.AttachmentFiles.Count -ge 1) {
+                        Copy-ShptListItemAttachment -SourceContext $srcCtx1 -SourceItem $oldListItem -DestinationContext $dstCtx2 -DestinationItem $dstItem
+                    }
                     Set-PnPListItem -List $ListName -Identity $NewListItem.Id `
                         -Values @{
                         "Author"   = $author.UserLogin
@@ -569,7 +577,7 @@ foreach ($oldListItem in $oldListItems) {
                         "Created"  = $fieldValues["Created"]
                         "Modified" = $fieldValues["Modified"]
                     } -Connection $conn2 1>$null
-                    $NewListItemId = $NewListItem.Id
+                    
                 }
                 else {
                     Write-Warning "$($NewFieldsDict.Title) was not created in $ListName"
@@ -589,53 +597,6 @@ foreach ($oldListItem in $oldListItems) {
                 }
             }
         }
-        <# This section is brand new and aims to cater for the List Item Attachments
-        if($oldListItem.AttachmentFiles.Count -ge 1) {
-            # Get attachments from source
-            $oldListItemAttachments = $oldListItem.AttachmentFiles
-            $SrcCtx1.Load($srcAttachments)
-            $SrcCtx1.ExecuteQuery()
-
-            foreach ($att in $oldListItemAttachments) {
-                Write-Host "  Migrating attachment $($att.FileName) for item $($fieldValues.Title):$($NewListItemId)" -ForegroundColor Cyan
-
-                # Download the file bytes
-                $fileInfo = [Microsoft.SharePoint.Client.File]::OpenBinaryDirect($SrcCtx1, $att.ServerRelativeUrl)
-                $ms = New-Object IO.MemoryStream
-                $fileInfo.Stream.CopyTo($ms)
-                $ms.Position = 0
-
-                # Build attachment upload path (hidden attachments folder under the item)
-                $dstList = $DstItem.ParentList
-                $DstCtx2.Load($dstList.RootFolder)
-                $DstCtx2.ExecuteQuery()
-
-                $attachmentsFolderUrl = "$($dstList.RootFolder.ServerRelativeUrl)/Attachments/$($DstItem.Id)"
-                $attachmentsFolder = $DstCtx.Web.GetFolderByServerRelativeUrl($attachmentsFolderUrl)
-
-                try {
-                    $DstCtx.Load($attachmentsFolder)
-                    $DstCtx.ExecuteQuery()
-                }
-                catch {
-                    # Create the attachments folder if it doesnâ€™t exist yet
-                    $attachmentsFolder = $dstList.RootFolder.Folders.Add("Attachments/$($DstItem.Id)")
-                    $DstCtx.ExecuteQuery()
-                }
-
-                # Upload the file into the attachment folder
-                $fileCI = New-Object Microsoft.SharePoint.Client.FileCreationInformation
-                $fileCI.Overwrite = $true
-                $fileCI.Url = $att.FileName
-                $fileCI.ContentStream = $ms
-
-                $uploadFile = $attachmentsFolder.Files.Add($fileCI)
-                $DstCtx.Load($uploadFile)
-                $DstCtx.ExecuteQuery()
-
-                $ms.Dispose()
-            }
-        }#>
     }
 }
 $endCreateItemsTime = Get-Date
