@@ -4,6 +4,9 @@ Import-Module SharePointPnPPowerShell2019 -Force -DisableNameChecking
 Import-Module SharePointServer -DisableNameChecking -Force
 
 . d:\scripts\Migration\function_Copy-ShptListItemAttachment.ps1
+. d:\scripts\Migration\function_New-ShptListFromOldList.ps1
+. d:\scripts\Migration\function_Get-ShptOldListStructure.ps1
+. d:\scripts\Migration\function_New-ShptListViewFromOldView.ps1
 
 $FolderName = "Deployables"
 $ListName = "Accessories"
@@ -37,8 +40,8 @@ if (Test-Path $incFile) {
 else {
     $lastMigration = get-date "01/01/1900"
 }
-
-$oldList = Get-PnPList -Identity $ListName -Connection $conn1
+$OldListStructure = Get-ShptOldListStructure -SrcConn $conn1 -ListName $ListName
+<#$oldList = Get-PnPList -Identity $ListName -Connection $conn1
 $oldListTitle = $oldList.Title
 $template = $oldList.BaseTemplate
 switch ($template) {
@@ -181,7 +184,7 @@ foreach ($oldListField in $oldListFields) {
         }
         $oldListFieldInfo += $oldlistFieldObj
     }
-}
+}#>
 
 $endOldListTime = Get-Date
 Write-Host "It took $([math]::Round(($endOldListTime - $scriptStartTime).TotalSeconds, 2)) seconds to get the old list field definitions" -ForegroundColor Yellow
@@ -189,7 +192,8 @@ Write-Host "It took $([math]::Round(($endOldListTime - $scriptStartTime).TotalSe
 $dstList = Get-PnPList -Identity $oldListTitle -Connection $conn2 -ErrorAction SilentlyContinue
 if (!$dstList) {
     $StartNewListTime = Get-Date
-    Write-Host "Creating $Type '$ListName'..." -ForegroundColor Magenta
+    New-ShptListFromOldList -SrcConn $conn1 -DstConn $conn2 -ListName $ListName -template $OldListStructure.oldListTemplate -ListType $OldListStructure.oldListType -oldListFieldInfo $OldListStructure.oldListFieldInfo
+    <#Write-Host "Creating $Type '$ListName'..." -ForegroundColor Magenta
     $dstList = New-PnPList -Title $ListName -Template $template -Connection $conn2 -EnableVersioning
     $dstList = Get-PnPList -Identity $dstList.Title -Connection $conn2 -ErrorAction SilentlyContinue
     $newTitle = "Title"
@@ -314,7 +318,7 @@ if (!$dstList) {
                 }
             }
         }
-    }
+    }#>
     $endNewListTime = Get-Date
     Write-Host "It took $([math]::Round(($endNewListTime - $StartNewListTime).TotalSeconds, 2)) seconds to create the list and configure the list field definitions" -ForegroundColor Yellow
 }
@@ -323,7 +327,8 @@ else {
 }
 
 $startViewCreateTime = Get-Date
-$oldViews = Get-PnPView -List $ListName -Connection $conn1
+New-ShptListViewFromOldView -SrcConn $conn1 -DstConn $conn2 -ListName $ListName
+<#$oldViews = Get-PnPView -List $ListName -Connection $conn1
 foreach ($oldView in $oldViews) {
     $oldViewFields = @()
     foreach ($OldViewField in $oldView.ViewFields) {
@@ -356,7 +361,7 @@ foreach ($oldView in $oldViews) {
         }
         Set-PnPView -List $ListName -Identity $newListView.Title -Values $oldViewValues -Connection $conn2 1>$null
     }
-}
+}#>
 $endViewCreateTime = Get-Date
 Write-Host "It took $([math]::Round(($endViewCreateTime - $startViewCreateTime).TotalSeconds, 2)) seconds to create $($oldViews.Count) list views" -ForegroundColor Yellow
 
@@ -567,7 +572,7 @@ foreach ($oldListItem in $oldListItems) {
                     $NewListItemId = $NewListItem.Id
                     $dstItem = Get-PnPListItem -list $ListName -Id $NewListItemId -Connection $conn2
                     Get-PnPProperty $oldListItem -Property AttachmentFiles -Connection $conn2 | Out-Null
-                    if($oldListItem.AttachmentFiles.Count -ge 1) {
+                    if ($oldListItem.AttachmentFiles.Count -ge 1) {
                         Copy-ShptListItemAttachment -SourceContext $srcCtx1 -SourceItem $oldListItem -DestinationContext $dstCtx2 -DestinationItem $dstItem
                     }
                     Set-PnPListItem -List $ListName -Identity $NewListItem.Id `
