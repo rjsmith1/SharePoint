@@ -379,11 +379,129 @@ foreach ($oldListItem in $oldListItems) {
     #$i++; $item.FieldValues. Title; Sitem. FileSystemObject Type; if(Si -eq Sii) {'STOP"; break}}
     $fieldValues = $oldListItem.Field.Values
     if ($isLibrary) {
+        $rootFolder = Get-PnPProperty -ClientObject $oldList -Property RootFolder -Connection $conn1
+        $folderItems = Get-PnPFolderItem -FolderSiteRelativeUrl $rootFolder.ServerRelativeUrl -ItemType File -Connection $conn1
+        $oneNoteNotebooks = $folderItems | Where-Object { $_.Name -like "*.onetoc2" }
+
+        if ($oneNoteNotebooks) {
+            Write-Warning "Detected OneNote Notebook(s) in library '$($oldList.Title)'. Switching to OneNote migration mode..."
+
+            foreach ($notebook in $oneNoteNotebooks) {
+                $notebookFolderUrl = Split-Path $notebook.ServerRelativeUrl -Parent
+                $notebookName = Split-Path $notebookFolderUrl -Leaf
+
+                try {
+                    Migrate-OneNoteNotebook `
+                        -SourceSiteUrl $SourceSiteUrl `
+                        -SourceNotebookServerRelativeUrl $notebookFolderUrl `
+                        -DestSiteUrl $DestSiteUrl `
+                        -DestLibrary $oldList.Title `
+                        -DestNotebookName $notebookName `
+                        -TempPath "C:\Temp\OneNoteMigration\$($oldList.Title)_$($notebookName)"
+
+                    Write-Host "Successfully migrated OneNote Notebook '$notebookName' from '$($oldList.Title)'." -ForegroundColor Green
+                }
+                catch {
+                    Write-Warning "Failed to migrate OneNote Notebook '$notebookName' `nException: $($_.Exception.Message)"
+                }
+            }
+
+            # Skip further library processing (since OneNote handled separately)
+            return
+        }
+        else {
+            Write-Host "No OneNote notebooks detected in '$($oldList.Title)'. Proceeding with standard file migration." -ForegroundColor Yellow
+        }
+        $NewFieldsDict = @{}
+        foreach ($NewListItemField in $NewListItemFields) {
+            Clear-Variable NewListItemFieldValue -ErrorAction SilentlyContinue
+            if($fieldValues[$NewListItemField.StaticName] -eq $null -and $NewListItemField.Title -ne $srcCommentField) { continue }
+            if ($NewListItemField.InternalName -eq "Title" -or ($NewListItemField.Hidden -eq $false -and $NewListItemField.CanBeDeleted -eq $true)) {
+                if ($NewListItemField.FieldTypeKind -eq "WorkflowStatus" -or $NewListItemField.FieldTypeKind -eq "Calculated" -or $NewListItemField.FieldTypeKind -eq "Computed") { 
+                    Continue #Do nothing, WorkflowStatus field is not necessary as it won't link to the Workflow from SP16 and Calculated/Computed fields are generated automatically
+                }
+                if($NewListItemField.FieldTypeKind -eq "Invalid") { Continue }
+                elseif ($NewListItemField.FieldTypeKind -eq "Note") {
+                    if($srcCommentField -eq $NewListItemField.Title) {
+                        $srcCommentPath = Join-Path $srcCommentsPath $fieldValues["ID"]
+                        if((Test-Path $srcCommentPath)) {
+                            $NewListItemFieldValue = (Get-Content (Join-Path $srcCommentPath 'comments.txt') -Raw).replace("&", "and")
+                            Write-Host "Old Item ID: $($fieldValues['ID'])`t Comment: $($NewListItemFieldValue)"
+                        }
+                        else {
+                            Write-Host "Original Item ID: $($fieldValues['ID']) doesn't have comments" -f Magenta
+                        }
+                    }
+                    else {
+                        $NewListItemFieldValue = $fieldValues[$NewListItemField.StaticName]
+                    }
+                }
+                elseif ($NewListItemField.FieldTypeKind -match "Lookup") {
+                    if ($NewListItemField.Title -like "*:*" -or $NewListItemField.InternalName -like "*_x003a_*") {
+                        Continue
+                    }
+                    else {
+                        Clear-Variable ListToQuery -ErrorAction SilentlyContinue
+                        Clear-Variable LookupQuery -ErrorAction SilentlyContinue
+                        Clear-Variable LookupValue -ErrorAction SilentlyContinue
+                        $ListToQuery = (Get-PnPList -Identity ($NewListItemField.LookupList) -Connection $conn1).Title
+                        if($fieldvalues[$NewListItemField.StaticName].Count -gt 1) {
+                            $NewListItemFieldValue = @()
+                            foreach($lookupValue in $fieldvalues[$NewListItemField.StaticName]) {
+                                $NewListItemFieldValue += (Get-PnPListItem -List $ListToQuery -Connection $conn2 | where { $_.FieldValues[$NewListItemField.LookupField] -eq $fieldValues[$NewListItemField.StaticName].LookupValue }).Id
+                            }
+                        }
+                        else {
+                            $NewListItemFieldValue = (Get-PnPListItem -List $ListToQuery -Connection $conn2 | where { $_.FieldValues[$NewListItemField.LookupField] -eq $fieldValues[$NewListItemField.StaticName].LookupValue }).Id
+                        }
+                    }
+                } 
+                elseif ($NewListItemField.FieldTypeKind -match "User") {
+                    if ($fieldValues[$NewListItemField.StaticName] -eq $null) {
+                        Continue
+                    }
+                    else {
+                        # I need a check here to see how a UserMulti value stores users; is it in an array/hasht able or plain text. This will dictate if I need to put a foreach loop in to appropriately ensureUser/NewUser
+                        Clear-Variable user -ErrorAction SilentlyContinue
+                        if($fieldValues[$NewListItemField.StaticName].email.split("@")[0] -like "*.*") {
+                            $user = Get-PnPUser -Connection $conn2 -ErrorAction SilentlyContinue | Where-Object Email -eq $fieldValues[$NewListItemField.StaticName].Email
+                        }
+                        else {
+                            $user = Get-PnPUser -Identity "i:0#.w|domain\$($fieldValues[$NewListItemField.StaticName].email.split("@")[0])" -Connection $conn2 -ErrorAction SilentlyContinue
+                        }
+                        if(!user) {
+                            Write-Warning "[Field=$($fieldValues[$NewListItemField.StaticName])] User '$($fieldValues[$NewListItemField.StaticName].email)' not found, attempting to create..."
+                            if($fieldValues[$NewListItemField.StaticName].email.split("@")[0] -like "*.*") {
+                                $user = New-PnPUser -LoginName "i:0#.w|domain\$((Get-AdUser -filter "EmailAddress -eq '$($fieldValues[$NewListItemField.StaticName].email)'").Name)" -Connection $conn2 -ErrorAction SilentlyContinue
+                            }
+                            else {
+                                $user = New-PnPUser -LoginName "i:0#.w|domain\$($fieldValues[$NewListItemField.StaticName].email.split("@")[0])" -Connection $conn2 -ErrorAction SilentlyContinue
+                            }
+                        }
+                        else {
+                            #Do Nothing
+                        }
+                    }
+                    if($user){
+                        $NewListItemFieldValue = "$($user.LoginName)"
+                    }
+                    else {
+                        Write-Warning "[Field=$($fieldValues[$NewListItemField.StaticName])] User '$($fieldValues[$NewListItemField.StaticName].email)' not found or unable to be created... not setting value"
+                    }
+                }
+                else {
+                    $NewListItemFieldValue = $fieldValues[$NewListItemField.StaticName]
+                }
+                if($NewListItemFieldValue) {
+                    $NewFieldsDict[$NewListItemField.StaticName] = $NewListItemFieldValue
+                }
+            }
+        }
         Get-PnPProperty -ClientObject $oldListItem.Folder -Property Files -Connection $conn1 | Out-Null
         Get-PnPProperty -ClientObject $dstList -Property Fields -Connection $conn2 | Out-Null
         if ($oldListItem.FileSystemObjectType -eq "Folder") {
             Clear-Variable FullPath -ErrorAction SilentlyContinue
-            $FullPath = $oldListItem.FieldValues. FileRef.replace($oldlist.RootFolder.ServerRelativeUrl, $dstList.RootFolder.ServerRelativeUrl).replace($dstList.ParentWebUrl, "")
+            $FullPath = $oldListItem.FieldValues.FileRef.replace($oldlist.RootFolder.ServerRelativeUrl, $dstList.RootFolder.ServerRelativeUrl).replace($dstList.ParentWebUrl, "")
             Resolve-PnPFolder $FullPath -Connection $conn2 1>$null
         }
         elseif ($oldListItem.FileSystemObjectType -eq "File") {
@@ -463,19 +581,45 @@ foreach ($oldListItem in $oldListItems) {
         $NewFieldsDict = @{}
         foreach ($NewListItemField in $NewListItemFields) {
             Clear-Variable NewListItemFieldValue -ErrorAction SilentlyContinue
+            if($fieldValues[$NewListItemField.StaticName] -eq $null -and $NewListItemField.Title -ne $srcCommentField) { continue }
             if ($NewListItemField.InternalName -eq "Title" -or ($NewListItemField.Hidden -eq $false -and $NewListItemField.CanBeDeleted -eq $true)) {
                 if ($NewListItemField.FieldTypeKind -eq "WorkflowStatus" -or $NewListItemField.FieldTypeKind -eq "Calculated" -or $NewListItemField.FieldTypeKind -eq "Computed") { 
                     Continue #Do nothing, WorkflowStatus field is not necessary as it won't link to the Workflow from SP16 and Calculated/Computed fields are generated automatically
                 }
-                if ($NewListItemField.FieldTypeKind -match "Lookup") {
+                if($NewListItemField.FieldTypeKind -eq "Invalid") { Continue }
+                elseif ($NewListItemField.FieldTypeKind -eq "Note") {
+                    if($srcCommentField -eq $NewListItemField.Title) {
+                        $srcCommentPath = Join-Path $srcCommentsPath $fieldValues["ID"]
+                        if((Test-Path $srcCommentPath)) {
+                            $NewListItemFieldValue = (Get-Content (Join-Path $srcCommentPath 'comments.txt') -Raw).replace("&", "and")
+                            Write-Host "Old Item ID: $($fieldValues['ID'])`t Comment: $($NewListItemFieldValue)"
+                        }
+                        else {
+                            Write-Host "Original Item ID: $($fieldValues['ID']) doesn't have comments" -f Magenta
+                        }
+                    }
+                    else {
+                        $NewListItemFieldValue = $fieldValues[$NewListItemField.StaticName]
+                    }
+                }
+                elseif ($NewListItemField.FieldTypeKind -match "Lookup") {
                     if ($NewListItemField.Title -like "*:*" -or $NewListItemField.InternalName -like "*_x003a_*") {
                         Continue
                     }
                     else {
                         Clear-Variable ListToQuery -ErrorAction SilentlyContinue
                         Clear-Variable LookupQuery -ErrorAction SilentlyContinue
+                        Clear-Variable LookupValue -ErrorAction SilentlyContinue
                         $ListToQuery = (Get-PnPList -Identity ($NewListItemField.LookupList) -Connection $conn1).Title
-                        $NewListItemFieldValue = (Get-PnPListItem -List $ListToQuery -Connection $conn2 | where { $_.FieldValues[$NewListItemField.LookupField] -eq $fieldValues[$NewListItemField.StaticName].LookupValue }).Id
+                        if($fieldvalues[$NewListItemField.StaticName].Count -gt 1) {
+                            $NewListItemFieldValue = @()
+                            foreach($lookupValue in $fieldvalues[$NewListItemField.StaticName]) {
+                                $NewListItemFieldValue += (Get-PnPListItem -List $ListToQuery -Connection $conn2 | where { $_.FieldValues[$NewListItemField.LookupField] -eq $fieldValues[$NewListItemField.StaticName].LookupValue }).Id
+                            }
+                        }
+                        else {
+                            $NewListItemFieldValue = (Get-PnPListItem -List $ListToQuery -Connection $conn2 | where { $_.FieldValues[$NewListItemField.LookupField] -eq $fieldValues[$NewListItemField.StaticName].LookupValue }).Id
+                        }
                     }
                 } 
                 elseif ($NewListItemField.FieldTypeKind -match "User") {
@@ -485,36 +629,50 @@ foreach ($oldListItem in $oldListItems) {
                     else {
                         # I need a check here to see how a UserMulti value stores users; is it in an array/hasht able or plain text. This will dictate if I need to put a foreach loop in to appropriately ensureUser/NewUser
                         Clear-Variable user -ErrorAction SilentlyContinue
-                        Clear-Variable email -ErrorAction SilentlyContinue
-                        $user = "domain\" + $fieldValues[$NewListItemField.StaticName].Email.Split("@")[0]
-                        if ($user -like "*.*") {
-                            $email = Get-PnPUser | Where-Object Email -eq $fieldValues[$NewListItemField.StaticName].Email
-                            if ($email) {
-                                $NewWeb = get-SPWeb $dstSite
-                                $NewListItemFieldValue = ($NewWeb.EnsureUser($user)).Userlogin
-                                if (!$NewListItemFieldValue) {
-                                    $NewListItemFieldValue = New-PnPUser -LoginName $user -Connection $conn2 1>$null
-                                }
+                        if($fieldValues[$NewListItemField.StaticName].email.split("@")[0] -like "*.*") {
+                            $user = Get-PnPUser -Connection $conn2 -ErrorAction SilentlyContinue | Where-Object Email -eq $fieldValues[$NewListItemField.StaticName].Email
+                        }
+                        else {
+                            $user = Get-PnPUser -Identity "i:0#.w|domain\$($fieldValues[$NewListItemField.StaticName].email.split("@")[0])" -Connection $conn2 -ErrorAction SilentlyContinue
+                        }
+                        if(!user) {
+                            Write-Warning "[Field=$($fieldValues[$NewListItemField.StaticName])] User '$($fieldValues[$NewListItemField.StaticName].email)' not found, attempting to create..."
+                            if($fieldValues[$NewListItemField.StaticName].email.split("@")[0] -like "*.*") {
+                                $user = New-PnPUser -LoginName "i:0#.w|domain\$((Get-AdUser -filter "EmailAddress -eq '$($fieldValues[$NewListItemField.StaticName].email)'").Name)" -Connection $conn2 -ErrorAction SilentlyContinue
+                            }
+                            else {
+                                $user = New-PnPUser -LoginName "i:0#.w|domain\$($fieldValues[$NewListItemField.StaticName].email.split("@")[0])" -Connection $conn2 -ErrorAction SilentlyContinue
                             }
                         }
+                        else {
+                            #Do Nothing
+                        }
+                    }
+                    if($user){
+                        $NewListItemFieldValue = "$($user.LoginName)"
+                    }
+                    else {
+                        Write-Warning "[Field=$($fieldValues[$NewListItemField.StaticName])] User '$($fieldValues[$NewListItemField.StaticName].email)' not found or unable to be created... not setting value"
                     }
                 }
                 else {
                     $NewListItemFieldValue = $fieldValues[$NewListItemField.StaticName]
                 }
-                $NewFieldsDict[$NewListItemField.StaticName] = $NewListItemFieldValue
+                if($NewListItemFieldValue) {
+                    $NewFieldsDict[$NewListItemField.StaticName] = $NewListItemFieldValue
+                }
             }
         }
         Clear-Variable AlreadyExists -ErrorAction SilentlyContinue
         Clear-Variable ExistingItem -ErrorAction SilentlyContinue
-        $AlreadyExists = Get-PnPListItem -List $ListName -PageSize 5000 -Connection $conn2 | Where-Object { $_.FieldValues.Title -eq $fieldValues.Title -and (Get-Date $fieldValues.Created.ToLocalTime() -Format "yyyy-MM-ddTHH:mm:ss.ffffffZ") }
+        $AlreadyExists = Get-PnPListItem -List $ListName -PageSize 11000 -Connection $conn2 | Where-Object { $_.FieldValues.Title -eq $fieldValues.Title -and (Get-Date $fieldValues.Created.ToLocalTime() -Format "yyyy-MM-ddTHH:mm:ss") }
         if ($AlreadyExists.Count -gt 1) {
             foreach ($ExistingItem in $AlreadyExists) {
-                if ((Get-Date $fieldValues.Created.ToLocalTime() -Format "yyyy-MM-ddTHH:mm:ss.ffffffZ") -eq (Get-Date $ExistingItem.Created.ToLocalTime() -Format "yyyy-MM-ddTHH:mm:ss.ffffffZ") -or (Get-Date -Format "yyyy-MM-dd") -eq (Get-Date $ExistingItem.Created.ToLocalTime() -Format "yyyy-MM-dd")) {
+                if ((Get-Date $fieldValues.Created.ToLocalTime() -Format "yyyy-MM-ddTHH:mm:ss") -eq (Get-Date $ExistingItem.Created.ToLocalTime() -Format "yyyy-MM-ddTHH:mm:ss") -or (Get-Date -Format "yyyy-MM-dd") -eq (Get-Date $ExistingItem.Created.ToLocalTime() -Format "yyyy-MM-dd")) {
                     $updateID = $ExistingItem.Id
                     $NewOrUpdate = "Update"
                 }
-                elseif ((get-date $fieldValues.Created.ToLocalTime() -Format "yyyy-MM-ddTHH:mm:ss.ffffffZ") -ne (get-date $ExistingItem.Created.ToLocalTime() -Format "yyyy-MM-ddTHH:mm:ss.ffffffZ")) {
+                elseif ((get-date $fieldValues.Created.ToLocalTime() -Format "yyyy-MM-ddTHH:mm:ss") -ne (get-date $ExistingItem.Created.ToLocalTime() -Format "yyyy-MM-ddTHH:mm:ss")) {
                     # Do Nothing...
                 }
                 else {
